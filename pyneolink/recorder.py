@@ -101,8 +101,10 @@ class StreamRecorder:
             sock.discard_sent()
         if hasattr(sock, "set_max_pending_chunks"):
             sock.set_max_pending_chunks(512)
+        from .camera import KEEPALIVE_INTERVAL
+
         deadline = None if self.duration is None else time.monotonic() + max(self.duration, 0.0)
-        next_keepalive_at = time.monotonic() + 0.75
+        next_keepalive_at = time.monotonic() + KEEPALIVE_INTERVAL
         next_flush_at = self.flush_bytes
 
         try:
@@ -113,11 +115,11 @@ class StreamRecorder:
 
                     now = time.monotonic()
                     if now >= next_keepalive_at:
-                        self.camera.send(MSG.UDP_KEEPALIVE, channel_id=0, msg_num=0)
+                        self.camera.send(MSG.PING, channel_id=0, msg_num=0)
                         sock = getattr(self.camera, "sock", None)
                         if hasattr(sock, "discard_sent"):
                             sock.discard_sent()
-                        next_keepalive_at = now + 0.75
+                        next_keepalive_at = now + KEEPALIVE_INTERVAL
 
                     try:
                         reply = self.camera._recv(timeout=0.5)

@@ -85,6 +85,17 @@ class Error(StrEnum):
     DownloadSizeMismatch = "Downloaded {actual_size} bytes, expected {expected_size} bytes"
     Mp4ConversionFailed = "Downloaded BCMedia, but MP4 conversion failed; raw stream saved to {raw_path}: {exc}"
     UnknownCommand = "Unknown command: {command}"
+    SdPreviewDumpTooLarge = "SD preview dump exceeded the {max_bytes} byte safety limit; pass max_bytes to adjust it"
+    ReceiveTimeout = "Timed out waiting for camera data"
+    LoginConnectionClosed = (
+        "Camera closed the connection during login negotiation; "
+        "modern firmware only accepts max_encryption='aes'"
+    )
+    ConfigParseFailed = "Could not parse config {path} as JSON ({json_error}) or as TOML ({toml_error})"
+    CameraConfigMissingName = "Camera config entry {index} is missing the required \"name\" field"
+    StreamKeyframeTimeout = "Timed out waiting for a keyframe from the camera stream"
+    IrSetTimeout = "Timed out waiting for IR light set response #{msg_num}"
+    PirSetTimeout = "Timed out waiting for PIR set response #{msg_num}"
 
 
 class Log(StrEnum):
@@ -119,3 +130,5 @@ class Log(StrEnum):
     OpenLocal = "Open locally with http://{host}:{port}/"
     Url = "  {url}"
     Pyneolink = "[pyneolink] {message}"
+    PreviewCacheWorkerStillRunning = "Preview cache worker is still running; keeping cache file {path}"
+    InfoFlagIgnored = "[pyneolink] Ignoring --info because the {command!r} command was given"

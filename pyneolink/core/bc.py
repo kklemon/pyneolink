@@ -186,15 +186,51 @@ def recv_exact(sock: socket.socket, size: int) -> bytes:
     return b"".join(chunks)
 
 
-def recv_message(sock: socket.socket, cipher: Cipher, *, timeout: float | None = None, binary_msg_nums: set[int] | None = None) -> Message:
+def _fill_buffer(sock: socket.socket, buffer: bytearray, size: int) -> None:
+    """Grow ``buffer`` to at least ``size`` bytes.
+
+    Unlike ``recv_exact``, already-received bytes stay in ``buffer`` when a
+    timeout interrupts the read, so a later call can resume mid-message.
+    """
+    while len(buffer) < size:
+        chunk = sock.recv(size - len(buffer))
+        if not chunk:
+            raise EOFError(msg.Error.CameraClosedConnection)
+        buffer.extend(chunk)
+
+
+def recv_message(
+    sock: socket.socket,
+    cipher: Cipher,
+    *,
+    timeout: float | None = None,
+    binary_msg_nums: set[int] | None = None,
+    buffer: bytearray | None = None,
+) -> Message:
+    """
+    Receive and decode one Baichuan message.
+
+    :param buffer: Optional persistent receive buffer. Pass the same bytearray
+        for every call on a connection so a timeout mid-message does not lose
+        partial data and desynchronize the byte stream.
+    """
     if timeout is not None:
         sock.settimeout(timeout)
-    first = recv_exact(sock, 20)
-    partial = Header.unpack_from(first)
-    if partial.has_payload_offset:
-        first += recv_exact(sock, 4)
-    header = Header.unpack_from(first)
-    body = recv_exact(sock, header.body_len) if header.body_len else b""
+    if buffer is None:
+        buffer = bytearray()
+    _fill_buffer(sock, buffer, 20)
+    try:
+        partial = Header.unpack_from(bytes(buffer[:20]))
+    except InvalidMagicError:
+        del buffer[:20]
+        raise
+    header_size = 24 if partial.has_payload_offset else 20
+    _fill_buffer(sock, buffer, header_size)
+    header = Header.unpack_from(bytes(buffer[:header_size]))
+    total = header_size + header.body_len
+    _fill_buffer(sock, buffer, total)
+    body = bytes(buffer[header_size:total])
+    del buffer[:total]
     ext_len = header.payload_offset or 0
     ext_raw = body[:ext_len]
     payload_raw = body[ext_len:]

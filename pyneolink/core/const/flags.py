@@ -72,6 +72,7 @@ class MSG(IntEnum):
     SET_PIR_ALARM = 213
     TALKCONFIG = 201
     TALK = 202
+    PING = 93
     UDP_KEEPALIVE = 234
     BATTERY = 253
     PLAY_AUDIO = 263

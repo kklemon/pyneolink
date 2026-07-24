@@ -769,7 +769,10 @@ def test_camera_replies_to_incoming_keepalive():
     assert header.response_code == 200
 
 
-def test_camera_replies_to_keepalive_even_when_response_is_200():
+def test_camera_replies_to_keepalive_requests_but_not_replies():
+    # Replying to keepalive *replies* (response_code != 0, observed 200/405 on
+    # real cameras) created a message storm: each side answered the other's
+    # answer at line rate. Only camera-initiated requests may be answered.
     class FakeSocket:
         def __init__(self, reply):
             self.reply = bytearray(reply)
@@ -789,17 +792,26 @@ def test_camera_replies_to_keepalive_even_when_response_is_200():
             del self.reply[:size]
             return chunk
 
-    incoming = encode_modern(MSG.UDP_KEEPALIVE, 0, response_code=200, cipher=Cipher("none"))
+    for response_code in (200, 405):
+        incoming = encode_modern(MSG.UDP_KEEPALIVE, 0, response_code=response_code, cipher=Cipher("none"))
+        camera = Camera(uuid="ABCDEF0123456789", password="secret", state_path=None)
+        camera.sock = FakeSocket(incoming)
+        camera.cipher = Cipher("none")
+        msg = camera._recv()
+        assert msg.header.msg_id == MSG.UDP_KEEPALIVE
+        assert msg.header.response_code == response_code
+        assert bytes(camera.sock.untracked) == b""
+
+    incoming = encode_modern(MSG.UDP_KEEPALIVE, 3, response_code=0, cipher=Cipher("none"))
     camera = Camera(uuid="ABCDEF0123456789", password="secret", state_path=None)
     camera.sock = FakeSocket(incoming)
     camera.cipher = Cipher("none")
     msg = camera._recv()
     sent = bytes(camera.sock.untracked)
     header = Header.unpack_from(sent[:24])
-    assert msg.header.msg_id == MSG.UDP_KEEPALIVE
-    assert msg.header.response_code == 200
+    assert msg.header.response_code == 0
     assert header.msg_id == MSG.UDP_KEEPALIVE
-    assert header.msg_num == 0
+    assert header.msg_num == 3
     assert header.response_code == 200
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import socket
+import threading
 import time
 from contextlib import AbstractContextManager
 from pathlib import Path
@@ -27,6 +28,11 @@ from .recorder import StreamRecorder
 from .sd_card import SdCard
 from .settings import Settings
 from .voice import Voice
+
+# Interval between stream keepalive pings. The cameras answer MSG.PING (93)
+# with 200/LinkType; MSG.UDP_KEEPALIVE (234) is rejected with 405 by modern
+# firmware, so pings are used for both TCP and UDP transports.
+KEEPALIVE_INTERVAL = 5.0
 
 
 class Camera(AbstractContextManager["Camera"]):
@@ -101,6 +107,9 @@ class Camera(AbstractContextManager["Camera"]):
         self.login_xml = ""
         self.debug = debug
         self._online_required = 0
+        self._rx_buffer = bytearray()
+        self._send_lock = threading.Lock()
+        self._recv_lock = threading.RLock()
 
     def __enter__(self) -> "Camera":
         self.connect()
@@ -112,6 +121,7 @@ class Camera(AbstractContextManager["Camera"]):
 
     def connect(self) -> None:
         """Open a transport connection to the camera."""
+        self._rx_buffer.clear()
         if (
             self.config.uid
             and not self.config.address
@@ -156,6 +166,8 @@ class Camera(AbstractContextManager["Camera"]):
             self.sock.close()
             self.sock = None
         self.login_xml = ""
+        self._rx_buffer.clear()
+        self.binary_msg_nums.clear()
 
     def reconnect(self) -> None:
         """Close, reconnect, and log in again."""
@@ -197,7 +209,10 @@ class Camera(AbstractContextManager["Camera"]):
             return self.login_xml
         msg_num = self._next_msg()
         self._send(encode_legacy_login(msg_num, max_encryption=max_encryption, channel_id=self.config.channel_id))
-        reply = self._recv()
+        try:
+            reply = self._recv()
+        except EOFError as exc:
+            raise ProtocolError(msg.Error.LoginConnectionClosed) from exc
         nonce = find_text(reply.xml_root, "nonce")
         if not nonce:
             raise ProtocolError(msg.Error.LoginNonce)
@@ -524,24 +539,29 @@ class Camera(AbstractContextManager["Camera"]):
                     return
                 return
 
-    def read_stream_payloads(self, stream: str = "mainStream"):
+    def read_stream_payloads(self, stream: str = "mainStream", *, idle_yield: bool = False):
         """Yield raw BCMedia payloads from a live stream.
 
         :param stream: Stream alias/name such as `high`, `low`, `mainStream`,
             or `subStream`.
+        :param idle_yield: Yield empty ``bytes`` when no payload arrived for a
+            moment, so consumers can run housekeeping (timeouts, idle checks)
+            instead of blocking inside the generator.
         """
         with self.require_online():
             msg_num = self.start_stream(stream)
-            next_keepalive_at = time.monotonic() + 0.75
+            next_keepalive_at = time.monotonic() + KEEPALIVE_INTERVAL
             try:
                 while True:
                     now = time.monotonic()
                     if now >= next_keepalive_at:
-                        self.send(MSG.UDP_KEEPALIVE, channel_id=0, msg_num=0)
-                        next_keepalive_at = now + 0.75
+                        self.send(MSG.PING, channel_id=0, msg_num=0)
+                        next_keepalive_at = now + KEEPALIVE_INTERVAL
                     try:
                         msg = self._recv(timeout=1.0)
                     except TimeoutError:
+                        if idle_yield:
+                            yield b""
                         continue
                     if msg.header.msg_id == MSG.VIDEO and msg.header.msg_num == msg_num and msg.payload:
                         yield msg.payload
@@ -591,15 +611,26 @@ class Camera(AbstractContextManager["Camera"]):
     def _send(self, data: bytes) -> None:
         if self.sock is None:
             raise RuntimeError(msg.Error.CameraNotConnected)
-        self.sock.sendall(data)
+        with self._send_lock:
+            self.sock.sendall(data)
 
     def _recv(self, timeout: float | None = None):
         if self.sock is None:
             raise RuntimeError(msg.Error.CameraNotConnected)
-        msg = recv_message(self.sock, self.cipher, timeout=self.timeout if timeout is None else timeout, binary_msg_nums=self.binary_msg_nums)
-        if msg.header.msg_id == MSG.UDP_KEEPALIVE:
-            self._reply_keepalive(msg)
-        return msg
+        effective_timeout = self.timeout if timeout is None else timeout
+        if effective_timeout is not None and effective_timeout <= 0:
+            raise TimeoutError(msg.Error.ReceiveTimeout)
+        with self._recv_lock:
+            received = recv_message(
+                self.sock,
+                self.cipher,
+                timeout=effective_timeout,
+                binary_msg_nums=self.binary_msg_nums,
+                buffer=self._rx_buffer,
+            )
+        if received.header.msg_id == MSG.UDP_KEEPALIVE and received.header.response_code == 0:
+            self._reply_keepalive(received)
+        return received
 
     def _reply_keepalive(self, keepalive_msg) -> None:
         if self.sock is None:
