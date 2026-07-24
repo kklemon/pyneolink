@@ -26,11 +26,11 @@ class XmlTemplate:
 
     def __mod__(self, values):
         if isinstance(values, tuple):
-            values = tuple(_escape(value) for value in values)
+            values = tuple(_XmlValue(value) for value in values)
         elif isinstance(values, dict):
-            values = {key: _escape(value) for key, value in values.items()}
+            values = {key: _XmlValue(value) for key, value in values.items()}
         else:
-            values = _escape(values)
+            values = _XmlValue(values)
         return self._finish(self.template % values)
 
     def _finish(self, text: str):
@@ -59,7 +59,8 @@ class _XmlValue:
         return text if self.raw else _escape(text)
 
     def __getattr__(self, name: str):
-        return _XmlValue(getattr(self.value, name))
+        inner = getattr(self.value, name)
+        return _XmlValue(Raw(inner) if self.raw else inner)
 
     def __str__(self) -> str:
         return self.__format__("")
