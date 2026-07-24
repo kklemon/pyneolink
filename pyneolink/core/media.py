@@ -35,6 +35,11 @@ class MediaPacket:
 class MediaParser:
     """Incremental BCMedia parser."""
 
+    # Upper bound for a single video frame. Real frames top out well below
+    # this; a larger value means the size field was parsed from corrupt data
+    # and the parser must resync instead of buffering indefinitely.
+    MAX_FRAME_BYTES = 16 * 1024 * 1024
+
     def __init__(self) -> None:
         """Create an empty parser."""
         self._buf = bytearray()
@@ -52,46 +57,49 @@ class MediaParser:
             yield packet
 
     def _try_one(self) -> MediaPacket | None:
-        if len(self._buf) < 8:
-            return None
-        magic = bytes(self._buf[:4])
-        if magic in (b"1001", b"1002"):
-            if len(self._buf) < 32:
-                return None
-            header_size, width, height = struct.unpack("<III", self._buf[4:16])
-            if header_size != 32:
-                self._resync()
-                return None
-            fps = self._buf[17]
-            del self._buf[:32]
-            return MediaPacket("info", None, None, b"", width, height, fps)
-        if _is_video_magic(magic):
-            if len(self._buf) < 24:
-                return None
-            codec = bytes(self._buf[4:8]).decode("ascii", errors="replace")
-            if codec not in ("H264", "H265"):
-                self._resync()
-                return None
-            size, extra, ts_us, _unknown = struct.unpack("<IIII", self._buf[8:24])
-            header_len = 24 + extra
-            total = header_len + size + ((8 - size % 8) % 8)
-            if len(self._buf) < total:
-                return None
-            payload = bytes(self._buf[header_len : header_len + size])
-            del self._buf[:total]
-            return MediaPacket("iframe" if magic[1:2] == b"0" else "pframe", codec, ts_us, payload)
-        if magic in (b"05wb", b"01wb"):
+        # Invalid data triggers a resync and another parse attempt in the same
+        # round; _resync always consumes at least one byte, so this terminates.
+        while True:
             if len(self._buf) < 8:
                 return None
-            size = struct.unpack("<H", self._buf[4:6])[0]
-            total = 8 + size + ((8 - size % 8) % 8)
-            if len(self._buf) < total:
-                return None
-            payload = bytes(self._buf[8 : 8 + size])
-            del self._buf[:total]
-            return MediaPacket("aac" if magic == b"05wb" else "adpcm", None, None, payload)
-        self._resync()
-        return None
+            magic = bytes(self._buf[:4])
+            if magic in (b"1001", b"1002"):
+                if len(self._buf) < 32:
+                    return None
+                header_size, width, height = struct.unpack("<III", self._buf[4:16])
+                if header_size != 32:
+                    self._resync()
+                    continue
+                fps = self._buf[17]
+                del self._buf[:32]
+                return MediaPacket("info", None, None, b"", width, height, fps)
+            if _is_video_magic(magic):
+                if len(self._buf) < 24:
+                    return None
+                codec = bytes(self._buf[4:8]).decode("ascii", errors="replace")
+                if codec not in ("H264", "H265"):
+                    self._resync()
+                    continue
+                size, extra, ts_us, _unknown = struct.unpack("<IIII", self._buf[8:24])
+                if size > self.MAX_FRAME_BYTES or extra > 0xFFFF:
+                    self._resync()
+                    continue
+                header_len = 24 + extra
+                total = header_len + size + ((8 - size % 8) % 8)
+                if len(self._buf) < total:
+                    return None
+                payload = bytes(self._buf[header_len : header_len + size])
+                del self._buf[:total]
+                return MediaPacket("iframe" if magic[1:2] == b"0" else "pframe", codec, ts_us, payload)
+            if magic in (b"05wb", b"01wb"):
+                size = struct.unpack("<H", self._buf[4:6])[0]
+                total = 8 + size + ((8 - size % 8) % 8)
+                if len(self._buf) < total:
+                    return None
+                payload = bytes(self._buf[8 : 8 + size])
+                del self._buf[:total]
+                return MediaPacket("aac" if magic == b"05wb" else "adpcm", None, None, payload)
+            self._resync()
 
     def _resync(self) -> None:
         magics = [b"1001", b"1002", b"05wb", b"01wb"]
@@ -100,7 +108,12 @@ class MediaParser:
             magics.append(bytes([channel]) + b"1dc")
         indexes = [self._buf.find(magic, 1) for magic in magics]
         indexes = [i for i in indexes if i >= 0]
-        del self._buf[: min(indexes) if indexes else len(self._buf)]
+        if indexes:
+            del self._buf[: min(indexes)]
+        else:
+            # No magic found; keep the last 3 bytes, which may be the prefix
+            # of a magic split across the chunk boundary.
+            del self._buf[: max(1, len(self._buf) - 3)]
 
 
 def looks_like_bcmedia(path: str | Path) -> bool:

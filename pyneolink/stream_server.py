@@ -18,6 +18,8 @@ _STREAM_END = object()
 _STREAM_QUEUE_TIMEOUT = 0.25
 _DEFAULT_HLS_BUFFER_MB = 100
 _DEFAULT_HLS_SEGMENT_SECONDS = 2.0
+_DEFAULT_HLS_IDLE_SECONDS = 60.0
+_KEYFRAME_DEADLINE_SECONDS = 30.0
 
 
 class StreamServer:
@@ -34,6 +36,7 @@ class StreamServer:
         buffer_seconds: float = 1.0,
         hls_buffer_mb: int = _DEFAULT_HLS_BUFFER_MB,
         hls_segment_seconds: float = _DEFAULT_HLS_SEGMENT_SECONDS,
+        hls_idle_seconds: float = _DEFAULT_HLS_IDLE_SECONDS,
     ) -> None:
         """Create an HTTP live stream server.
 
@@ -45,6 +48,9 @@ class StreamServer:
         :param buffer_seconds: Startup buffer for direct MPEG-TS streams.
         :param hls_buffer_mb: Maximum in-memory HLS timeshift buffer size.
         :param hls_segment_seconds: Target HLS segment duration.
+        :param hls_idle_seconds: Stop an HLS camera session after this many
+            seconds without playlist/segment requests (important for battery
+            cameras). The session restarts on the next request.
         """
         self.config = _coerce_config(config)
         self.host = host if host is not None else self.config.bind
@@ -54,6 +60,7 @@ class StreamServer:
         self.buffer_seconds = max(buffer_seconds, 0.0)
         self.hls_buffer_bytes = max(int(hls_buffer_mb), 1) * 1024 * 1024
         self.hls_segment_seconds = max(hls_segment_seconds, 0.5)
+        self.hls_idle_seconds = max(hls_idle_seconds, 5.0)
 
     def urls(self, *, host: str | None = None) -> list[str]:
         """Return stream URLs for configured cameras.
@@ -79,6 +86,7 @@ class StreamServer:
         server.buffer_seconds = self.buffer_seconds
         server.hls_buffer_bytes = self.hls_buffer_bytes
         server.hls_segment_seconds = self.hls_segment_seconds
+        server.hls_idle_seconds = self.hls_idle_seconds
         server.hls_sessions = {}
         server.hls_sessions_lock = threading.Lock()
         print(msg.Log.Serving.format(host=self.host, port=self.port))
@@ -100,6 +108,7 @@ def serve_streams(
     buffer_seconds: float = 1.0,
     hls_buffer_mb: int = _DEFAULT_HLS_BUFFER_MB,
     hls_segment_seconds: float = _DEFAULT_HLS_SEGMENT_SECONDS,
+    hls_idle_seconds: float = _DEFAULT_HLS_IDLE_SECONDS,
 ) -> None:
     """Serve configured camera streams forever.
 
@@ -111,6 +120,7 @@ def serve_streams(
     :param buffer_seconds: Startup buffer for direct MPEG-TS streams.
     :param hls_buffer_mb: Maximum in-memory HLS timeshift buffer size.
     :param hls_segment_seconds: Target HLS segment duration.
+    :param hls_idle_seconds: Stop idle HLS camera sessions after this delay.
     """
     StreamServer(
         config_path,
@@ -121,6 +131,7 @@ def serve_streams(
         buffer_seconds=buffer_seconds,
         hls_buffer_mb=hls_buffer_mb,
         hls_segment_seconds=hls_segment_seconds,
+        hls_idle_seconds=hls_idle_seconds,
     ).serve_forever()
 
 
@@ -140,6 +151,7 @@ class _StreamServer(ThreadingHTTPServer):
     buffer_seconds: float
     hls_buffer_bytes: int
     hls_segment_seconds: float
+    hls_idle_seconds: float
     hls_sessions: dict[tuple[str, str], "HlsSession"]
     hls_sessions_lock: threading.Lock
 
@@ -185,7 +197,7 @@ class _StreamHandler(BaseHTTPRequestHandler):
         parser = MediaParser()
         try:
             camera.__enter__()
-            payloads = camera.read_stream_payloads(stream)
+            payloads = camera.read_stream_payloads(stream, idle_yield=True)
             first_packets, codec, fps = _read_until_keyframe(payloads, parser)
             first_packets = _buffer_initial_video(payloads, parser, first_packets, fps, self.server.buffer_seconds)
             if codec in ("H264", "H265"):
@@ -260,7 +272,7 @@ class _StreamHandler(BaseHTTPRequestHandler):
         key = (camera_config.name, stream)
         with self.server.hls_sessions_lock:
             session = self.server.hls_sessions.get(key)
-            if session is None:
+            if session is None or session.finished:
                 session = HlsSession(
                     camera_config,
                     stream,
@@ -268,6 +280,7 @@ class _StreamHandler(BaseHTTPRequestHandler):
                     debug=self.server.debug,
                     buffer_bytes=self.server.hls_buffer_bytes,
                     segment_seconds=self.server.hls_segment_seconds,
+                    idle_seconds=self.server.hls_idle_seconds,
                 )
                 self.server.hls_sessions[key] = session
             session.start()
@@ -367,6 +380,28 @@ class MpegTsMuxer:
         self.tables_written = False
         self.video_pts = 0
         self.audio_pts = 0
+        self._last_ts_us: int | None = None
+        self._pts_base = 0
+        self._ts_accum_us = 0
+
+    def _video_pts_from_timestamp(self, timestamp_us: int) -> int:
+        """Map the camera's 32-bit microsecond counter to a monotonic PTS.
+
+        The raw counter wraps every ~71.6 minutes; mapping it directly to PTS
+        would jump backwards and stall players. Deltas are computed modulo
+        2**32 and accumulated instead, with implausible gaps (>10s, e.g. a
+        camera-side restart) clamped to one frame duration.
+        """
+        if self._last_ts_us is None:
+            self._last_ts_us = timestamp_us
+            self._pts_base = timestamp_us * 9 // 100
+            return self._pts_base
+        delta = (timestamp_us - self._last_ts_us) & 0xFFFFFFFF
+        self._last_ts_us = timestamp_us
+        if delta > 10_000_000:
+            delta = 1_000_000 // self.fps
+        self._ts_accum_us += delta
+        return self._pts_base + self._ts_accum_us * 9 // 100
 
     def feed(self, packet: MediaPacket) -> Iterable[bytes]:
         """
@@ -380,7 +415,7 @@ class MpegTsMuxer:
 
         if packet.kind in ("iframe", "pframe"):
             if packet.timestamp_us is not None:
-                self.video_pts = int(packet.timestamp_us * 90_000 / 1_000_000)
+                self.video_pts = self._video_pts_from_timestamp(packet.timestamp_us)
             else:
                 self.video_pts += 90_000 // self.fps
             pes = _pes_packet(0xE0, self.video_pts, packet.data, unbounded=True)
@@ -456,6 +491,7 @@ class HlsSession:
         debug: bool,
         buffer_bytes: int,
         segment_seconds: float,
+        idle_seconds: float = _DEFAULT_HLS_IDLE_SECONDS,
     ) -> None:
         """Create an HLS session.
 
@@ -465,6 +501,8 @@ class HlsSession:
         :param debug: Print protocol/debug output.
         :param buffer_bytes: Maximum in-memory HLS buffer size.
         :param segment_seconds: Target HLS segment duration.
+        :param idle_seconds: Stop the camera stream after this long without
+            playlist/segment requests.
         """
         self.camera_config = camera_config
         self.stream = stream
@@ -472,12 +510,15 @@ class HlsSession:
         self.debug = debug
         self.buffer_bytes = buffer_bytes
         self.segment_seconds = segment_seconds
+        self.idle_seconds = idle_seconds
         self.lock = threading.Lock()
         self.condition = threading.Condition(self.lock)
         self.segments: list[HlsSegment] = []
         self.total_bytes = 0
         self.next_sequence = 0
         self.started = False
+        self.finished = False
+        self.last_access = time.monotonic()
         self.error: BaseException | None = None
 
     def start(self) -> None:
@@ -496,9 +537,10 @@ class HlsSession:
         """
 
         self.start()
+        self.last_access = time.monotonic()
         deadline = time.monotonic() + timeout
         with self.condition:
-            while not self.segments and self.error is None and time.monotonic() < deadline:
+            while not self.segments and self.error is None and not self.finished and time.monotonic() < deadline:
                 self.condition.wait(timeout=0.25)
             if self.error and not self.segments:
                 raise self.error
@@ -513,6 +555,7 @@ class HlsSession:
         """
 
         self.start()
+        self.last_access = time.monotonic()
         with self.lock:
             for segment in self.segments:
                 if segment.sequence == sequence:
@@ -524,7 +567,7 @@ class HlsSession:
         parser = MediaParser()
         try:
             camera.__enter__()
-            payloads = camera.read_stream_payloads(self.stream)
+            payloads = camera.read_stream_payloads(self.stream, idle_yield=True)
             first_packets, codec, fps = _read_until_keyframe(payloads, parser)
             if codec not in ("H264", "H265"):
                 raise RuntimeError(msg.Error.HlsRequiresH264OrH265)
@@ -557,14 +600,20 @@ class HlsSession:
             for packet in first_packets:
                 add_packet(packet)
             for payload in payloads:
+                if time.monotonic() - self.last_access > self.idle_seconds:
+                    break
+                if not payload:
+                    continue
                 for packet in parser.feed(payload):
                     add_packet(packet)
         except BaseException as exc:
             with self.condition:
                 self.error = exc
-                self.condition.notify_all()
         finally:
             camera.close()
+            with self.condition:
+                self.finished = True
+                self.condition.notify_all()
 
     def _append_segment(self, data: bytes, duration: float) -> None:
         if not data:
@@ -683,10 +732,18 @@ def _is_client_disconnect(exc: OSError) -> bool:
     return getattr(exc, "winerror", None) in (10053, 10054) or getattr(exc, "errno", None) in (32, 104)
 
 
-def _read_until_keyframe(payloads: Iterable[bytes], parser: MediaParser) -> tuple[list[MediaPacket], str | None, int]:
+def _read_until_keyframe(
+    payloads: Iterable[bytes],
+    parser: MediaParser,
+    *,
+    deadline_seconds: float = _KEYFRAME_DEADLINE_SECONDS,
+) -> tuple[list[MediaPacket], str | None, int]:
     fps = 15
     packets: list[MediaPacket] = []
+    deadline = time.monotonic() + deadline_seconds
     for payload in payloads:
+        if time.monotonic() > deadline:
+            raise TimeoutError(msg.Error.StreamKeyframeTimeout)
         for packet in parser.feed(payload):
             if packet.kind == "info" and packet.fps:
                 fps = packet.fps
@@ -711,7 +768,10 @@ def _buffer_initial_video(
     if target_frames <= video_count:
         return packets
     buffered = list(packets)
+    deadline = time.monotonic() + max(buffer_seconds * 3.0, 10.0)
     for payload in payloads:
+        if time.monotonic() > deadline:
+            return buffered
         for packet in parser.feed(payload):
             buffered.append(packet)
             if packet.kind in ("iframe", "pframe"):
