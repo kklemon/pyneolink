@@ -190,6 +190,7 @@ class Voice:
         next_play_end = time.monotonic()
         sent = 0
         first_sent_at: float | None = None
+        audio_since_service = 0.0
         for block in blocks:
             packet = serialize_bcmedia_adpcm(block)
             sent_at = time.monotonic()
@@ -214,11 +215,31 @@ class Voice:
                 )
             play_seconds = _adpcm_block_duration(block, config.sample_rate)
             next_play_end = max(next_play_end, sent_at) + play_seconds
+            if not wait_ack:
+                audio_since_service += play_seconds
+                if audio_since_service >= 0.25:
+                    audio_since_service = 0.0
+                    self._service_transport()
             sleep_for = next_play_end - time.monotonic()
             if sleep_for > 0:
                 time.sleep(sleep_for)
         elapsed = time.monotonic() - first_sent_at if first_sent_at is not None else 0.0
         self._debug(f"talk chunks sent={sent} elapsed={elapsed:.3f}s")
+
+    def _service_transport(self) -> None:
+        """Drain pending camera replies and run transport maintenance.
+
+        Keeps UDP ACK processing and heartbeats alive while the talk pacing
+        loop is otherwise only sending and sleeping.
+        """
+        sock = getattr(self.camera, "sock", None)
+        if sock is not None and hasattr(sock, "maintain"):
+            sock.maintain()
+        for _ in range(16):
+            try:
+                self.camera._recv(timeout=0.01)
+            except TimeoutError:
+                return
 
     def _drain_talk_replies(self, *, seconds: float = 0.25) -> None:
         if self._last_talk_msg_num is None:

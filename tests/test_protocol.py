@@ -1017,9 +1017,12 @@ def test_voice_adpcm_bcmedia_packet_shape():
     assert packet[12:].startswith(block)
 
 
-def test_voice_adpcm_packs_high_nibble_first():
-    block = ImaAdpcmEncoder().encode_block([0, 1000, 2000])
-    assert block[4] >> 4 != 0
+def test_voice_adpcm_packs_low_nibble_first():
+    # IMA/DVI-WAV convention (used by ffmpeg and gstreamer/neolink): the first
+    # sample of each pair goes into the LOW nibble. [0, 1000, 0] encodes to
+    # codes 0x7 then 0xA, so the first data byte must be 0xA7, not 0x7A.
+    block = ImaAdpcmEncoder().encode_block([0, 1000, 0])
+    assert block[4] == 0xA7
 
 
 def test_voice_adpcm_level_hint_reports_silence_as_zero():

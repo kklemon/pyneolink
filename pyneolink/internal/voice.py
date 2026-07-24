@@ -85,6 +85,50 @@ class _PcmStats:
             self.peak = max(self.peak, max(abs(sample) for sample in samples))
 
 
+_FFMPEG_REAP_TIMEOUT = 5.0
+
+
+def _reap_ffmpeg(process: subprocess.Popen, *, kill: bool) -> tuple[int | None, str, bool]:
+    """Reap an ffmpeg child process without risking a pipe deadlock.
+
+    When the consumer closed the generator early (``kill`` is True) and the
+    child is still running, it is killed first so a blocked stdout pipe can
+    never make the stderr read or the wait hang forever. In all cases the
+    remaining pipe data is drained with a bounded timeout instead of blocking
+    reads.
+
+    :param process: The ffmpeg subprocess.
+    :param kill: Whether to terminate a still-running process immediately.
+    :return: Tuple of ``(returncode, stderr_text, killed)``. ``killed`` is True
+        when this call terminated the process itself, in which case the
+        returncode is not meaningful as an ffmpeg error indicator.
+    """
+    killed = False
+    if kill and process.poll() is None:
+        process.kill()
+        killed = True
+    stderr_data: bytes | None = b""
+    try:
+        _, stderr_data = process.communicate(timeout=_FFMPEG_REAP_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        killed = True
+        try:
+            _, stderr_data = process.communicate(timeout=_FFMPEG_REAP_TIMEOUT)
+        except (subprocess.TimeoutExpired, OSError, ValueError):
+            stderr_data = b""
+    except (OSError, ValueError):
+        stderr_data = b""
+    for pipe in (process.stdin, process.stdout, process.stderr):
+        if pipe is not None:
+            try:
+                pipe.close()
+            except OSError:
+                pass
+    stderr = (stderr_data or b"").decode("utf-8", errors="replace")
+    return process.returncode, stderr, killed
+
+
 def parse_talk_config(root, *, channel_id: int) -> TalkConfig:  # noqa: ANN001
     if root is None:
         raise ProtocolError(msg.Error.VoiceNotSupported)
@@ -186,11 +230,17 @@ def adpcm_blocks_from_file(
     assert process.stdout is not None
     encoder = ImaAdpcmEncoder()
     stats = _PcmStats()
+    pcm_blocks: Iterable[bytes] = iter_pcm_blocks(process.stdout, config.samples_per_block)
+    if on_debug is not None:
+        pcm_blocks = observe_pcm_blocks(pcm_blocks, stats)
+    early_close = False
     try:
-        yield from adpcm_blocks_from_pcm_bytes(observe_pcm_blocks(iter_pcm_blocks(process.stdout, config.samples_per_block), stats), encoder)
+        yield from adpcm_blocks_from_pcm_bytes(pcm_blocks, encoder)
+    except GeneratorExit:
+        early_close = True
+        raise
     finally:
-        stderr = process.stderr.read().decode("utf-8", errors="replace") if process.stderr else ""
-        code = process.wait()
+        code, stderr, killed = _reap_ffmpeg(process, kill=early_close)
         if on_debug is not None:
             on_debug(
                 "file pcm stats "
@@ -199,7 +249,7 @@ def adpcm_blocks_from_file(
             )
             if stderr.strip():
                 on_debug("ffmpeg stderr " + " ".join(stderr.split())[:800])
-        if code != 0:
+        if not killed and code not in (None, 0):
             raise RuntimeError(msg.Error.VoiceFfmpegFailed.format(detail=stderr.strip() or f"exit code {code}"))
 
 
@@ -236,12 +286,15 @@ def adpcm_blocks_from_file_ffmpeg(
     ]
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     assert process.stdout is not None
+    early_close = False
     try:
         yield from iter_wav_data_blocks(process.stdout, config.block_align)
+    except GeneratorExit:
+        early_close = True
+        raise
     finally:
-        stderr = process.stderr.read().decode("utf-8", errors="replace") if process.stderr else ""
-        code = process.wait()
-        if code != 0:
+        code, stderr, killed = _reap_ffmpeg(process, kill=early_close)
+        if not killed and code not in (None, 0):
             raise RuntimeError(msg.Error.VoiceFfmpegFailed.format(detail=stderr.strip() or f"exit code {code}"))
 
 
@@ -326,7 +379,10 @@ def adpcm_blocks_from_microphone(config: TalkConfig, *, volume: float = 1.0, sec
         callback=callback,
     ):
         while seconds is None or time.monotonic() - started < seconds:
-            pcm = q.get()
+            try:
+                pcm = q.get(timeout=1.0)
+            except queue.Empty:
+                continue
             if volume != 1.0:
                 pcm = scale_pcm16(pcm, volume)
             yield from adpcm_blocks_from_pcm_bytes([pcm], encoder)
@@ -481,8 +537,8 @@ class ImaAdpcmEncoder:
         nibbles = [self._encode_sample(sample) for sample in samples[1:]]
         packed = bytearray()
         for pos in range(0, len(nibbles), 2):
-            high = nibbles[pos]
-            low = nibbles[pos + 1] if pos + 1 < len(nibbles) else 0
+            low = nibbles[pos]
+            high = nibbles[pos + 1] if pos + 1 < len(nibbles) else 0
             packed.append((high << 4) | low)
         return header + bytes(packed)
 
