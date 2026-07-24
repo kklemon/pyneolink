@@ -5,9 +5,12 @@ from datetime import date, datetime, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterable
+import tempfile
 import threading
 import time as monotonic_clock
 import random
+import uuid
+import warnings
 import xml.etree.ElementTree as ET
 
 from .core.bc import (
@@ -83,6 +86,7 @@ class SDFile:
         progress=False,
         max_attempts: int = 3,
         reconnect_retries: int = 3,
+        max_passes: int = 4,
         rewrite_exists: bool = True,
         recv_timeout: float = 2.0,
     ) -> Path:
@@ -100,6 +104,9 @@ class SDFile:
             try for one connection.
         :param reconnect_retries: Number of reconnect attempts after an
             interrupted download before raising `CameraConnectionError`.
+        :param max_passes: Maximum number of full download passes (reconnect
+            plus retry of all strategies) before giving up with the last
+            download error.
         :param rewrite_exists: When `False`, skip an already finalized local
             file. Non-empty `.mp4` files are treated as complete.
         :param recv_timeout: Per-read timeout while waiting for download data.
@@ -114,6 +121,7 @@ class SDFile:
             progress=progress,
             max_attempts=max_attempts,
             reconnect_retries=reconnect_retries,
+            max_passes=max_passes,
             rewrite_exists=rewrite_exists,
             recv_timeout=recv_timeout,
         )
@@ -132,8 +140,9 @@ class SDFile:
     ) -> SDFilePreview:
         """Open a cached preview stream context for this SD-card file.
 
-        :param cache: Cache file or directory. A temporary file is used when
-            omitted.
+        :param cache: Cache file or directory. When omitted, a uniquely named
+            cache file under the system temporary directory is used and
+            removed on exit when `cleanup` is enabled.
         :param stream_type: Reolink stream type, usually `mainStream` or
             `subStream`.
         :param channel_id: Optional channel override.
@@ -244,8 +253,18 @@ class SDFilePreview:
     def close(self) -> None:
         """Stop caching and optionally remove the temporary cache file."""
         self._stop.set()
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=max(self.recv_timeout * 2, 5.0))
+        thread = self._thread
+        if thread and thread.is_alive():
+            thread.join(timeout=max(self.recv_timeout * 2, 5.0))
+            if thread.is_alive():
+                thread.join(timeout=max(self.recv_timeout * 4, 10.0))
+        if thread and thread.is_alive():
+            warnings.warn(
+                const_msg.Log.PreviewCacheWorkerStillRunning.format(path=self.path),
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return
         if self.cleanup and self.path.exists():
             _remove_file(self.path)
 
@@ -404,6 +423,9 @@ class SdCard:
         self._last_download_detail = ""
         self._active_replay_name: str | None = None
         self._playback_channel_id = 0
+        self._abandoned_msg_nums: set[int] = set()
+        self._last_attempt_msg_nums: set[int] = set()
+        self._raw_tail_recovery = False
 
     def list(
         self,
@@ -441,7 +463,7 @@ class SdCard:
         for target_day in days:
             day_start = max(start_dt, datetime.combine(target_day, time.min))
             day_end = min(end_dt, datetime.combine(target_day, time.max))
-            files.extend(self._list_day_files(channel, day_start, day_end, stream_type, attempts))
+            files.extend(self._list_day_files(channel, day_start, day_end, stream_type, file_type, attempts))
         _sort_recordings(files, sort)
         self.last_attempts = attempts
         return [item.to_dict() for item in files] if as_dict else files
@@ -505,10 +527,10 @@ class SdCard:
                 days.append(start.date().fromordinal(start.date().toordinal() + index))
         return [day for day in days if start.date() <= day <= end.date()]
 
-    def _list_day_files(self, channel: int, start: datetime, end: datetime, stream_type: str, attempts: list[str]) -> list[SdCardFile]:
+    def _list_day_files(self, channel: int, start: datetime, end: datetime, stream_type: str, file_type: str, attempts: list[str]) -> list[SdCardFile]:
         files = []
         seen = set()
-        for handle_query in _handle_queries(channel, start, end, stream_type):
+        for handle_query in _handle_queries(channel, start, end, stream_type, file_type):
             reply = _send_query(self.camera, handle_query, attempts)
             if not reply or reply.header.response_code != 200:
                 continue
@@ -537,6 +559,7 @@ class SdCard:
     ) -> bool:
         for detail_query in _handle_detail_queries(channel, handle):
             got_response = False
+            previous_identities: set[tuple] | None = None
             for page in range(1, max_pages + 1):
                 detail = _send_query(self.camera, detail_query, attempts)
                 if not detail or detail.header.response_code != 200:
@@ -550,9 +573,11 @@ class SdCard:
                     success["label"] = f"{detail_query.label}/page-{page}"
                 self.last_successes.append(success)
                 page_files = [item for item in _parse_file_list(detail.xml_root) if item.file_name]
-                added = _append_unique_files(files, page_files, seen)
-                if not page_files or added == 0:
+                page_identities = {_file_identity(item) for item in page_files}
+                _append_unique_files(files, page_files, seen)
+                if not page_files or page_identities == previous_identities:
                     return True
+                previous_identities = page_identities
             if got_response:
                 return True
         return False
@@ -609,6 +634,7 @@ class SdCard:
         progress=False,
         max_attempts: int = 3,
         reconnect_retries: int = 3,
+        max_passes: int = 4,
         rewrite_exists: bool = True,
         recv_timeout: float = 2.0,
     ) -> Path:
@@ -627,6 +653,9 @@ class SdCard:
             try for one connection.
         :param reconnect_retries: Number of reconnect attempts after an
             interrupted download before raising `CameraConnectionError`.
+        :param max_passes: Maximum number of full download passes (reconnect
+            plus retry of all strategies) before giving up with the last
+            download error.
         :param rewrite_exists: When `False`, skip an already finalized local
             file. Non-empty `.mp4` files are treated as complete.
         :param recv_timeout: Per-read timeout while waiting for download data.
@@ -655,7 +684,9 @@ class SdCard:
             _emit_progress_message(progress, _existing_download_mismatch_message(output_path, expected_size))
 
         self.last_download_attempts = []
-        while True:
+        total_passes = max(int(max_passes), 1)
+        last_error: BaseException | None = None
+        for pass_number in range(1, total_passes + 1):
             try:
                 return self._download_once(
                     item,
@@ -669,11 +700,17 @@ class SdCard:
                     recv_timeout=recv_timeout,
                 )
             except DownloadSizeMismatch as exc:
+                last_error = exc
                 _emit_progress_message(progress, f"  download incomplete: {exc}")
-                self._reconnect_for_download(file_name, reconnect_retries, progress, exc)
             except TimeoutError as exc:
+                last_error = exc
                 _emit_progress_message(progress, f"  download failed: {type(exc).__name__}: {exc}")
-                self._reconnect_for_download(file_name, reconnect_retries, progress, exc)
+            _trim_attempt_log(self.last_download_attempts)
+            if pass_number >= total_passes:
+                break
+            self._reconnect_for_download(file_name, reconnect_retries, progress, last_error)
+        assert last_error is not None
+        raise last_error
 
     def _reconnect_for_download(
         self,
@@ -726,12 +763,15 @@ class SdCard:
         best_mismatch: tuple[str, int] | None = None
         self._playback_channel_id = random.randint(16, 63)
         raw["_playbackChannelId"] = self._playback_channel_id
+        self._abandoned_msg_nums = set()
         effective_max_attempts = max(max_attempts, 5) if forced_high else max_attempts
         for index, query in enumerate(_download_queries(self.camera.config.channel_id, str(file_id), raw)):
             if effective_max_attempts and index >= effective_max_attempts:
                 break
             part_path = output_path.with_name(output_path.name + f".{_safe_label(query.label)}.part")
             _remove_file(part_path)
+            self._last_attempt_msg_nums = set()
+            self._raw_tail_recovery = False
             try:
                 if query.label.startswith("replay5/"):
                     self._prepare_replay_download(raw)
@@ -744,48 +784,45 @@ class SdCard:
                     progress=progress,
                     recv_timeout=recv_timeout,
                 )
-                if query.label.startswith("replay5/"):
-                    self._stop_replay_download(raw)
-                if query.label.startswith("playback143/"):
-                    self._stop_playback_download()
             except TimeoutError as exc:
-                if query.label.startswith("replay5/"):
-                    self._stop_replay_download(raw)
-                if query.label.startswith("playback143/"):
-                    self._stop_playback_download()
+                self._abandon_download_strategy(query, raw, recv_timeout=recv_timeout)
                 self.last_download_attempts.append(f"{query.label}: timeout{_transport_snapshot_text(self.camera.sock)}")
-                _remove_empty_file(part_path)
+                _remove_file(part_path)
                 last_error = exc
                 continue
             except ProtocolError as exc:
-                if query.label.startswith("replay5/"):
-                    self._stop_replay_download(raw)
-                if query.label.startswith("playback143/"):
-                    self._stop_playback_download()
+                self._abandon_download_strategy(query, raw, recv_timeout=recv_timeout)
                 self.last_download_attempts.append(f"{query.label}: {exc}{_transport_snapshot_text(self.camera.sock)}")
-                _remove_empty_file(part_path)
+                _remove_file(part_path)
                 last_error = exc
                 continue
             except Exception as exc:
                 if query.label.startswith("replay5/"):
-                    self._stop_replay_download(raw)
+                    self._abandon_download_strategy(query, raw, recv_timeout=recv_timeout)
                     self.last_download_attempts.append(f"{query.label}: {type(exc).__name__}: {exc}{_transport_snapshot_text(self.camera.sock)}")
-                    _remove_empty_file(part_path)
+                    _remove_file(part_path)
                     last_error = exc
                     continue
                 if query.label.startswith("playback143/"):
-                    self._stop_playback_download()
+                    self._abandon_download_strategy(query, raw, recv_timeout=recv_timeout)
                 raise
             detail = f", {self._last_download_detail}" if self._last_download_detail else ""
             self.last_download_attempts.append(f"{query.label}: wrote {written} bytes{detail}")
             if written:
                 if expected_size is not None and written != expected_size and (forced_high or not query.label.startswith("playback143/")):
+                    self._abandon_download_strategy(query, raw, recv_timeout=recv_timeout, drain=False)
                     _remove_file(part_path)
                     if best_mismatch is None or written > best_mismatch[1]:
                         best_mismatch = (query.label, written)
                     self._reconnect_after_download()
                     continue
-                return _finalize_download(part_path, output_path, expected_size if forced_high else (None if query.label.startswith("playback143/") else expected_size))
+                self._stop_download_strategy(query, raw)
+                result = _finalize_download(part_path, output_path, expected_size if forced_high else (None if query.label.startswith("playback143/") else expected_size))
+                if self._raw_tail_recovery:
+                    self._reconnect_after_download()
+                _remove_stale_part_files(output_path)
+                return result
+            self._abandon_download_strategy(query, raw, recv_timeout=recv_timeout)
             _remove_empty_file(part_path)
         if best_mismatch and expected_size is not None:
             label, written = best_mismatch
@@ -815,26 +852,88 @@ class SdCard:
         msg_class = query.msg_class if query.msg_class is not None else (MSG_CLASS.FILE_DOWNLOAD if not replay_mode else MSG_CLASS.MODERN)
         msg_num = self.camera.send(query.msg_id, query.payload, msg_class=msg_class, channel_id=query.channel_id, msg_num=query.msg_num)
         accepted_msg_nums = {msg_num}
-        chunks = 0
-        written = 0
-        effective_expected_size = expected_size
-        deadline_misses = 0
+        self._last_attempt_msg_nums = accepted_msg_nums
+        self._abandoned_msg_nums.discard(msg_num)
+        self._raw_tail_recovery = False
+        registered_binary_msg_nums: set[int] = set()
+
+        def register_binary(*nums: int) -> None:
+            for num in nums:
+                self.camera.binary_msg_nums.add(num)
+                registered_binary_msg_nums.add(num)
+
         self._last_download_detail = ""
-        max_raw_payload_len = 0
-        max_payload_len = 0
-        encrypted_lens: set[int] = set()
         startup_idle_seconds = max(recv_timeout * 2, 2.0)
+        startup_timeout_budget = max(int(startup_idle_seconds / max(recv_timeout, 0.001) + 0.999), 2)
         active_idle_seconds = max(recv_timeout * idle_timeouts, 20.0)
         last_progress = monotonic_clock.monotonic()
         next_progress_at = 0
         progress_step = 512 * 1024
         next_keepalive_at = monotonic_clock.monotonic()
+        try:
+            written = self._run_download_loop(
+                query,
+                output_path,
+                msg_num=msg_num,
+                accepted_msg_nums=accepted_msg_nums,
+                register_binary=register_binary,
+                replay_mode=replay_mode,
+                playback_mode=playback_mode,
+                expected_size=expected_size,
+                chunk_limit=chunk_limit,
+                progress=progress,
+                recv_timeout=recv_timeout,
+                idle_timeouts=idle_timeouts,
+                startup_idle_seconds=startup_idle_seconds,
+                startup_timeout_budget=startup_timeout_budget,
+                active_idle_seconds=active_idle_seconds,
+                last_progress=last_progress,
+                next_progress_at=next_progress_at,
+                progress_step=progress_step,
+                next_keepalive_at=next_keepalive_at,
+            )
+        finally:
+            for num in registered_binary_msg_nums:
+                self.camera.binary_msg_nums.discard(num)
+        return written
+
+    def _run_download_loop(
+        self,
+        query: _FileInfoQuery,
+        output_path: Path,
+        *,
+        msg_num: int,
+        accepted_msg_nums: set[int],
+        register_binary,
+        replay_mode: bool,
+        playback_mode: bool,
+        expected_size: int | None,
+        chunk_limit: int,
+        progress,
+        recv_timeout: float,
+        idle_timeouts: int,
+        startup_idle_seconds: float,
+        startup_timeout_budget: int,
+        active_idle_seconds: float,
+        last_progress: float,
+        next_progress_at: int,
+        progress_step: int,
+        next_keepalive_at: float,
+    ) -> int:
+        chunks = 0
+        written = 0
+        effective_expected_size = expected_size
+        deadline_misses = 0
+        max_raw_payload_len = 0
+        max_payload_len = 0
+        encrypted_lens: set[int] = set()
         with output_path.open("wb") as fh:
             while True:
                 next_keepalive_at = self._send_download_keepalive(next_keepalive_at)
                 try:
                     msg = self.camera._recv(timeout=recv_timeout)
                 except InvalidMagicError as exc:
+                    self._raw_tail_recovery = True
                     if exc.data:
                         payload = _clip_payload(exc.data, written, effective_expected_size)
                         fh.write(payload)
@@ -871,8 +970,13 @@ class SdCard:
                     if written:
                         self._last_download_detail = f"idle timeout after {deadline_misses} recv timeouts, chunks={chunks}, msg_nums={len(accepted_msg_nums)}"
                         break
+                    if (
+                        deadline_misses < startup_timeout_budget
+                        and monotonic_clock.monotonic() - last_progress < startup_idle_seconds
+                    ):
+                        continue
                     raise
-                if not _is_download_message(msg, query.msg_id, accepted_msg_nums, written > 0):
+                if not _is_download_message(msg, query.msg_id, accepted_msg_nums, written > 0, abandoned_msg_nums=self._abandoned_msg_nums):
                     idle_limit = active_idle_seconds if written else startup_idle_seconds
                     if monotonic_clock.monotonic() - last_progress >= idle_limit:
                         if written:
@@ -909,8 +1013,7 @@ class SdCard:
                         break
                     raise ProtocolError(_response_detail(msg, const_msg.Error.Response.format(response_code=msg.header.response_code)))
                 if b"<binaryData>1</binaryData>" in msg.extension:
-                    self.camera.binary_msg_nums.add(msg_num)
-                    self.camera.binary_msg_nums.add(msg.header.msg_num)
+                    register_binary(msg_num, msg.header.msg_num)
                 xml_text = msg.xml_text
                 if xml_text and _looks_like_xml(xml_text):
                     self.last_xml = xml_text
@@ -918,8 +1021,7 @@ class SdCard:
                         playback_size = _xml_file_size(xml_text)
                         if playback_size:
                             effective_expected_size = playback_size
-                            self.camera.binary_msg_nums.add(msg_num)
-                            self.camera.binary_msg_nums.add(msg.header.msg_num)
+                            register_binary(msg_num, msg.header.msg_num)
                             continue
                     if _download_xml_done_text(xml_text):
                         self._last_download_detail = (
@@ -927,8 +1029,7 @@ class SdCard:
                             f"msg_nums={len(accepted_msg_nums)}, xml={_one_line_preview(xml_text)}"
                         )
                         break
-                    self.camera.binary_msg_nums.add(msg_num)
-                    self.camera.binary_msg_nums.add(msg.header.msg_num)
+                    register_binary(msg_num, msg.header.msg_num)
                     continue
                 if msg.payload:
                     payload = _clip_payload(msg.payload, written, effective_expected_size)
@@ -1046,10 +1147,46 @@ class SdCard:
             pass
 
     def _stop_playback_download(self) -> None:
+        channel_id = self._playback_channel_id or random.randint(64, 255)
         try:
-            self.camera.send(MSG.FILE_PLAYBACK_STOP, channel_id=random.randint(64, 255), msg_num=0)
+            self.camera.send(MSG.FILE_PLAYBACK_STOP, channel_id=channel_id, msg_num=0)
         except Exception:
             pass
+
+    def _stop_download_strategy(self, query: _FileInfoQuery, raw: dict) -> None:
+        if query.label.startswith("replay5/"):
+            self._stop_replay_download(raw)
+        if query.label.startswith("playback143/"):
+            self._stop_playback_download()
+
+    def _abandon_download_strategy(self, query: _FileInfoQuery, raw: dict, *, recv_timeout: float, drain: bool = True) -> None:
+        """Best-effort cancel of an abandoned download strategy.
+
+        Sends the matching stop message, remembers the strategy message
+        numbers so late chunks are not mistaken for the next strategy, and
+        briefly drains pending messages from streaming strategies.
+        """
+        self._abandoned_msg_nums.update(self._last_attempt_msg_nums)
+        self._stop_download_strategy(query, raw)
+        if drain and query.label.startswith(("replay5/", "playback143/")):
+            self._drain_camera_messages(timeout=min(max(recv_timeout, 0.05), 0.3))
+
+    def _drain_camera_messages(self, *, timeout: float = 0.3, max_messages: int = 8) -> None:
+        """Discard a few pending camera messages, stopping on the first timeout."""
+        for _ in range(max_messages):
+            try:
+                self.camera._recv(timeout=timeout)
+            except TimeoutError:
+                return
+            except Exception:
+                return
+
+    def _cancel_preview_transfer(self, recv_timeout: float) -> None:
+        try:
+            self.camera.send(MSG.FILE_PLAYBACK_STOP, msg_num=0)
+        except Exception:
+            pass
+        self._drain_camera_messages(timeout=min(max(recv_timeout, 0.05), 0.3))
 
     def _send_download_keepalive(self, next_at: float) -> float:
         now = monotonic_clock.monotonic()
@@ -1070,13 +1207,13 @@ class SdCard:
             self.last_download_attempts.append(f"reconnect-after-download: {type(exc).__name__}: {exc}")
 
     def remove(self, file: dict | SdCardFile | str, *, confirm: bool = False) -> None:
-        """Remove an SD-card file.
+        """Remove an SD-card file. Not implemented yet; always raises
+        `NotImplementedError`.
 
         :param file: File dict, `SdCardFile`, or path/name string.
-        :param confirm: Must be `True` to allow the operation.
+        :param confirm: Reserved for the future implementation, which will
+            require `confirm=True` before deleting anything.
         """
-        if not confirm:
-            raise DangerousSdCardOperation(const_msg.Error.SdRemoveNeedsConfirm)
         raise NotImplementedError(const_msg.Error.SdRemoveNotImplemented)
 
     def format(self, *, confirm: bool = False, confirmation_text: str = "", disk_id: int = 0) -> None:
@@ -1108,7 +1245,11 @@ class SdCard:
         target = _coerce_date(day or date.today())
         attempts = []
         for query in _day_record_queries(self.camera.config.channel_id, target):
-            reply = self.camera.command(query.msg_id, query.payload, extension=query.extension)
+            try:
+                reply = self.camera.command(query.msg_id, query.payload, extension=query.extension)
+            except TimeoutError:
+                attempts.append(f"{query.label}: timeout")
+                continue
             attempts.append(f"{query.label}: {reply.header.response_code}")
             if reply.header.response_code == 200:
                 self.last_attempts = attempts
@@ -1250,7 +1391,9 @@ class SdCard:
             progress string.
         :param recv_timeout: Per-read timeout while waiting for preview data.
         :param idle_timeouts: Number of idle read timeouts before stopping.
-        :param max_bytes: Optional maximum raw bytes to collect.
+        :param max_bytes: Maximum raw bytes to collect. When omitted, a
+            256 MiB safety limit applies and exceeding it raises
+            `ProtocolError` instead of buffering unbounded data.
         """
 
         item = _file_to_dict(file)
@@ -1315,41 +1458,11 @@ class SdCard:
         expected_total = 0
         deadline_misses = 0
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        with output_path.open("wb") as fh:
-            raw_seen, mp4_offset, mp4_started, expected_total = _write_preview_cache_payload(
-                fh,
-                reply.payload or b"",
-                head=head,
-                raw_seen=raw_seen,
-                mp4_offset=mp4_offset,
-                mp4_started=mp4_started,
-                expected_total=expected_total,
-                ready=ready,
-            )
-            while not stop.is_set():
-                if expected_total and raw_seen >= expected_total:
-                    break
-                if max_bytes is not None and raw_seen >= max_bytes:
-                    break
-                try:
-                    msg = self.camera._recv(timeout=recv_timeout)
-                except TimeoutError:
-                    deadline_misses += 1
-                    if deadline_misses >= idle_timeouts:
-                        break
-                    continue
-                if msg.header.msg_num != msg_num and not _is_download_continuation(msg, query.msg_id, mp4_started or bool(head)):
-                    continue
-                if msg.header.response_code not in (0, 200):
-                    break
-                if not msg.payload:
-                    continue
-                deadline_misses = 0
-                remaining = None if max_bytes is None else max(max_bytes - raw_seen, 0)
-                payload = msg.payload if remaining is None else msg.payload[:remaining]
+        try:
+            with output_path.open("wb") as fh:
                 raw_seen, mp4_offset, mp4_started, expected_total = _write_preview_cache_payload(
                     fh,
-                    payload,
+                    reply.payload or b"",
                     head=head,
                     raw_seen=raw_seen,
                     mp4_offset=mp4_offset,
@@ -1357,10 +1470,44 @@ class SdCard:
                     expected_total=expected_total,
                     ready=ready,
                 )
-                if progress and raw_seen % (512 * 1024) < len(payload):
-                    total_text = f"/{expected_total}" if expected_total else ""
-                    _emit_progress_message(progress, f"  preview cache bytes: {raw_seen}{total_text}")
-        ready.set()
+                while not stop.is_set():
+                    if expected_total and raw_seen >= expected_total:
+                        break
+                    if max_bytes is not None and raw_seen >= max_bytes:
+                        break
+                    try:
+                        msg = self.camera._recv(timeout=recv_timeout)
+                    except TimeoutError:
+                        deadline_misses += 1
+                        if deadline_misses >= idle_timeouts:
+                            break
+                        continue
+                    if msg.header.msg_num != msg_num and not _is_download_continuation(msg, query.msg_id, mp4_started or bool(head)):
+                        continue
+                    if msg.header.response_code not in (0, 200):
+                        break
+                    if not msg.payload:
+                        continue
+                    deadline_misses = 0
+                    remaining = None if max_bytes is None else max(max_bytes - raw_seen, 0)
+                    payload = msg.payload if remaining is None else msg.payload[:remaining]
+                    raw_seen, mp4_offset, mp4_started, expected_total = _write_preview_cache_payload(
+                        fh,
+                        payload,
+                        head=head,
+                        raw_seen=raw_seen,
+                        mp4_offset=mp4_offset,
+                        mp4_started=mp4_started,
+                        expected_total=expected_total,
+                        ready=ready,
+                    )
+                    if progress and raw_seen % (512 * 1024) < len(payload):
+                        total_text = f"/{expected_total}" if expected_total else ""
+                        _emit_progress_message(progress, f"  preview cache bytes: {raw_seen}{total_text}")
+        finally:
+            if stop.is_set() or not (expected_total and raw_seen >= expected_total):
+                self._cancel_preview_transfer(recv_timeout)
+            ready.set()
         return output_path
 
     def _read_preview_dump(
@@ -1384,12 +1531,16 @@ class SdCard:
         if reply.header.response_code not in (0, 200):
             raise ProtocolError(_response_detail(reply, const_msg.Error.Response.format(response_code=reply.header.response_code)))
         data = bytearray(reply.payload or b"")
-        expected_total = _embedded_mp4_total_size(data)
+        size_tracker = _EmbeddedMp4SizeTracker()
+        expected_total = size_tracker.feed(data)
+        byte_limit = _PREVIEW_DUMP_MAX_BYTES if max_bytes is None else max_bytes
         deadline_misses = 0
         while True:
             if expected_total and len(data) >= expected_total:
                 break
-            if max_bytes is not None and len(data) >= max_bytes:
+            if len(data) >= byte_limit:
+                if max_bytes is None:
+                    raise ProtocolError(const_msg.Error.SdPreviewDumpTooLarge.format(max_bytes=byte_limit))
                 break
             try:
                 msg = self.camera._recv(timeout=recv_timeout)
@@ -1404,11 +1555,10 @@ class SdCard:
                 break
             if not msg.payload:
                 continue
-            remaining = None if max_bytes is None else max(max_bytes - len(data), 0)
-            chunk = msg.payload if remaining is None else msg.payload[:remaining]
+            chunk = msg.payload if max_bytes is None else msg.payload[: max(max_bytes - len(data), 0)]
             data.extend(chunk)
             deadline_misses = 0
-            expected_total = expected_total or _embedded_mp4_total_size(data)
+            expected_total = expected_total or size_tracker.feed(data)
             if progress and len(data) % (512 * 1024) < len(chunk):
                 total_text = f"/{expected_total}" if expected_total else ""
                 _emit_progress_message(progress, f"  preview dump bytes: {len(data)}{total_text}")
@@ -1493,89 +1643,14 @@ _TIME_OR_FILE_KEYS = {
     "time",
 }
 
-_STREAM_TYPE_CANDIDATES = ("mainStream", "subStream", "clear", "fluent")
-_FILE_TYPE_CANDIDATES = ("All", "all", "Rec", "rec", "record", "Record", "MD", "motion", "alarm", "human", "vehicle", "visitor")
+_PREVIEW_DUMP_MAX_BYTES = 256 * 1024 * 1024
+_ATTEMPT_LOG_LIMIT = 200
+_DEFAULT_RECORD_TYPES = "manual, sched, io, md, people, face, vehicle, dog_cat, visitor"
 
 
-def _file_info_queries(channel: int, start: datetime, end: datetime, stream_type: str, file_type: str) -> list[_FileInfoQuery]:
-    msg_ids = [
-        ("replay", MSG.FILE_REPLAY),
-        ("info14", MSG.FILE_INFO_LIST),
-        ("info15", MSG.FILE_INFO_LIST_ALT),
-        ("info16", MSG.FILE_INFO_LIST_ALT2),
-    ]
-    variants = [
-        *[
-            (
-                f"compact-{type_value}",
-                payloads.file_info_compact_type.format(channel_id=channel, start=start, end=end, type_value=type_value),
-            )
-            for type_value in _FILE_TYPE_CANDIDATES
-        ],
-        *[
-            (
-                f"compact-{stream_value}",
-                payloads.file_info_compact_stream.format(channel_id=channel, start=start, end=end, stream_type=stream_value),
-            )
-            for stream_value in _STREAM_TYPE_CANDIDATES
-        ],
-        *[
-            (
-                f"compact-{stream_value}-{type_value}",
-                payloads.file_info_compact_stream_type.format(channel_id=channel, start=start, end=end, stream_type=stream_value, type_value=type_value),
-            )
-            for stream_value in _STREAM_TYPE_CANDIDATES
-            for type_value in _FILE_TYPE_CANDIDATES
-        ],
-        (
-            "nested-basic",
-            payloads.file_info_nested.format(
-                channel_id=channel,
-                stream_type=stream_type,
-                start_time=_time_fragment("beginTime", start),
-                end_time=_time_fragment("endTime", end),
-            ),
-        ),
-        (
-            "nested-type",
-            payloads.file_info_nested_type.format(
-                channel_id=channel,
-                stream_type=stream_type,
-                file_type=file_type,
-                start_time=_time_fragment("beginTime", start),
-                end_time=_time_fragment("endTime", end),
-            ),
-        ),
-        (
-            "start-end",
-            payloads.file_info_nested.format(
-                channel_id=channel,
-                stream_type=stream_type,
-                start_time=_time_fragment("startTime", start),
-                end_time=_time_fragment("endTime", end),
-            ),
-        ),
-        (
-            "flat",
-            payloads.file_info_flat.format(
-                channel_id=channel,
-                stream_type=stream_type,
-                begin_time=_flat_time_fragment("begin", start),
-                end_time=_flat_time_fragment("end", end),
-            ),
-        ),
-        (
-            "compact",
-            payloads.file_info_compact_stream.format(channel_id=channel, start=start, end=end, stream_type=stream_type),
-        ),
-    ]
-    queries = []
-    ext = payloads.extension.format(channel_id=channel)
-    for payload_label, payload in variants:
-        for msg_label, msg_id in msg_ids:
-            queries.append(_FileInfoQuery(f"{msg_label}/{payload_label}", msg_id, payload))
-            queries.append(_FileInfoQuery(f"{msg_label}/{payload_label}+ext", msg_id, payload, ext))
-    return queries
+def _trim_attempt_log(attempts: list[str], limit: int = _ATTEMPT_LOG_LIMIT) -> None:
+    if len(attempts) > limit:
+        del attempts[: len(attempts) - limit]
 
 
 def _day_records_range_query(channel: int, start: datetime, end: datetime) -> _FileInfoQuery:
@@ -1590,8 +1665,8 @@ def _day_records_range_query(channel: int, start: datetime, end: datetime) -> _F
     )
 
 
-def _handle_queries(channel: int, start: datetime, end: datetime, stream_type: str) -> list[_FileInfoQuery]:
-    record_types = "manual, sched, io, md, people, face, vehicle, dog_cat, visitor"
+def _handle_queries(channel: int, start: datetime, end: datetime, stream_type: str, file_type: str = "All") -> list[_FileInfoQuery]:
+    record_types = _DEFAULT_RECORD_TYPES if not file_type or str(file_type).strip().lower() == "all" else str(file_type).strip()
     streams = [stream_type]
     if stream_type != "subStream":
         streams.append("subStream")
@@ -1695,10 +1770,6 @@ def _coerce_datetime(value: datetime | date | str | None, *, end_of_day: bool) -
 
 def _time_fragment(tag: str, value: datetime) -> payloads.Raw:
     return payloads.Raw(payloads.time_node.format(tag=tag, value=value))
-
-
-def _flat_time_fragment(prefix: str, value: datetime) -> payloads.Raw:
-    return payloads.Raw(payloads.flat_time.format(prefix=prefix, value=value))
 
 
 def _parse_time(raw: dict, *keys: str) -> datetime | None:
@@ -2167,7 +2238,10 @@ def _preview_output_path(output: str | Path, file_name: str, *, raw: bool) -> Pa
 def _preview_cache_path(cache: str | Path | None, item: dict) -> Path:
     file_name = item.get("file_name") or Path(str(item.get("path") or "preview.mp4")).name
     if cache is None:
-        return Path(".tmp") / "pyneolink-preview-cache" / f"{Path(file_name).stem or 'preview'}.preview.mp4"
+        # System temp dir plus a unique component: concurrent previews of
+        # same-named files (main/sub stream, different days) must not collide.
+        stem = Path(file_name).stem or "preview"
+        return Path(tempfile.gettempdir()) / "pyneolink-preview-cache" / f"{stem}.{uuid.uuid4().hex[:8]}.preview.mp4"
     cache_path = Path(cache)
     if cache_path.is_dir() or str(cache).endswith(("/", "\\")):
         return cache_path / f"{Path(file_name).stem or 'preview'}.preview.mp4"
@@ -2217,6 +2291,57 @@ def _extract_embedded_mp4_bytes(payload: bytes) -> bytes:
         return b""
     total = _embedded_mp4_total_size(payload)
     return payload[offset:total] if total else payload[offset:]
+
+
+class _EmbeddedMp4SizeTracker:
+    """Incrementally track the embedded-MP4 total size of a growing buffer.
+
+    Avoids re-scanning the whole accumulated payload per chunk: `ftyp` is only
+    searched within the first `_SCAN_LIMIT` bytes, and MP4 box headers are
+    walked forward from the last known box boundary.
+    """
+
+    _SCAN_LIMIT = 64 * 1024
+    _MAX_BOXES = 12
+
+    def __init__(self) -> None:
+        self._pos: int | None = None
+        self._boxes = 0
+        self._total: int | None = None
+        self._done = False
+
+    def feed(self, data: bytes | bytearray) -> int | None:
+        """Consume the accumulated buffer and return the total size if known."""
+        if self._total is not None or self._done:
+            return self._total
+        if self._pos is None:
+            marker = bytes(data[: self._SCAN_LIMIT]).find(b"ftyp")
+            if marker < 4:
+                if len(data) >= self._SCAN_LIMIT:
+                    self._done = True
+                return None
+            self._pos = marker - 4
+        while self._pos + 8 <= len(data) and self._boxes < self._MAX_BOXES:
+            size = int.from_bytes(data[self._pos : self._pos + 4], "big")
+            box_type = bytes(data[self._pos + 4 : self._pos + 8])
+            if size == 0:
+                self._done = True
+                return None
+            if size == 1:
+                if self._pos + 16 > len(data):
+                    return None
+                size = int.from_bytes(data[self._pos + 8 : self._pos + 16], "big")
+            if size < 8:
+                self._done = True
+                return None
+            if box_type == b"mdat":
+                self._total = self._pos + size
+                return self._total
+            self._pos += size
+            self._boxes += 1
+        if self._boxes >= self._MAX_BOXES:
+            self._done = True
+        return None
 
 
 def _embedded_mp4_total_size(payload: bytes | bytearray) -> int | None:
@@ -2303,7 +2428,9 @@ def _one_line_preview(value: str | bytes, limit: int = 320) -> str:
     return text if len(text) <= limit else f"{text[:limit]}..."
 
 
-def _is_download_continuation(msg, query_msg_id: int, download_started: bool) -> bool:
+def _is_download_continuation(msg, query_msg_id: int, download_started: bool, abandoned_msg_nums: set[int] | None = None) -> bool:
+    if abandoned_msg_nums and msg.header.msg_num in abandoned_msg_nums:
+        return False
     if msg.header.msg_id not in (query_msg_id, MSG.FILE_REPLAY, MSG.FILE_DOWNLOAD_VIDEO, MSG.FILE_DOWNLOAD):
         return False
     if msg.header.response_code not in (0, 200):
@@ -2315,12 +2442,12 @@ def _is_download_continuation(msg, query_msg_id: int, download_started: bool) ->
     return download_started and bool(msg.payload)
 
 
-def _is_download_message(msg, query_msg_id: int, accepted_msg_nums: set[int], download_started: bool) -> bool:
+def _is_download_message(msg, query_msg_id: int, accepted_msg_nums: set[int], download_started: bool, abandoned_msg_nums: set[int] | None = None) -> bool:
     if msg.header.msg_num in accepted_msg_nums:
         if msg.header.msg_num != 0:
             return True
-        return msg.header.msg_id == query_msg_id or _is_download_continuation(msg, query_msg_id, download_started)
-    return _is_download_continuation(msg, query_msg_id, download_started)
+        return msg.header.msg_id == query_msg_id or _is_download_continuation(msg, query_msg_id, download_started, abandoned_msg_nums)
+    return _is_download_continuation(msg, query_msg_id, download_started, abandoned_msg_nums)
 
 
 def _emit_progress(progress, written: int, expected_size: int | None, chunks: int, sock) -> None:

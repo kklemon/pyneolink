@@ -1783,13 +1783,22 @@ def test_sd_card_file_wrapper_exposes_info_download_and_preview(tmp_path):
     assert preview.path == tmp_path / "clip.preview.mp4"
 
 
-def test_sd_card_preview_default_cache_uses_local_tmp_directory():
+def test_sd_card_preview_default_cache_uses_system_tmp_and_unique_names():
+    import tempfile
+
     class FakeCamera:
         config = type("Config", (), {"channel_id": 0})()
 
-    preview = SdCard(FakeCamera()).file({"file_name": "clip.mp4"}).preview()
+    sd_file = SdCard(FakeCamera()).file({"file_name": "clip.mp4"})
+    first = sd_file.preview()
+    second = sd_file.preview()
 
-    assert preview.path == Path(".tmp") / "pyneolink-preview-cache" / "clip.preview.mp4"
+    expected_dir = Path(tempfile.gettempdir()) / "pyneolink-preview-cache"
+    assert first.path.parent == expected_dir
+    assert first.path.name.startswith("clip.")
+    assert first.path.name.endswith(".preview.mp4")
+    # Concurrent previews of same-named files must not share a cache file.
+    assert first.path != second.path
 
 
 def test_sd_card_preview_server_streams_from_start_and_cleans_after_disconnect(tmp_path):
