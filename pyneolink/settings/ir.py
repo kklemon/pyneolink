@@ -87,10 +87,20 @@ class Ir:
         self._wait_for_set_reply(msg_num)
 
     def _wait_for_set_reply(self, msg_num: int) -> None:
-        deadline = time.monotonic() + 0.75
-        while time.monotonic() < deadline:
+        """Wait up to the camera's timeout for the SET_LED reply.
+
+        :param msg_num: Message number of the outstanding SET request.
+        :raises TimeoutError: If the camera never confirms the request; a
+            lost reply is not reported as success.
+        :raises ProtocolError: If the camera rejects the request.
+        """
+        deadline = time.monotonic() + getattr(self.camera, "timeout", 10.0)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(msg.Error.IrSetTimeout.format(msg_num=msg_num))
             try:
-                reply = self.camera._recv(timeout=min(0.1, max(0.0, deadline - time.monotonic())))
+                reply = self.camera._recv(timeout=min(0.5, remaining))
             except TimeoutError:
                 continue
             if reply.header.msg_num != msg_num:

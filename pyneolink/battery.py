@@ -84,7 +84,12 @@ class Battery:
 
 
 class BatteryInfoUpdates:
-    """Iterator/context manager for repeated battery polling."""
+    """Iterator/context manager for repeated battery polling.
+
+    Prefer wrapping in `with` (or calling `close()`) so the camera's online
+    lease is released deterministically; abandoned iterators only release the
+    lease when garbage collected.
+    """
 
     def __init__(
         self,
@@ -133,11 +138,23 @@ class BatteryInfoUpdates:
         return self.battery.refresh(mode=self.mode)
 
     def close(self) -> None:
+        """Stop iteration and release the online lease. Idempotent."""
         lease = getattr(self, "_online_lease", None)
+        self._online_lease = None
         if lease is not None:
             lease.__exit__(None, None, None)
-            self._online_lease = None
         self.closed = True
+
+    def __del__(self) -> None:
+        # Safety net for abandoned iterators: release only the online-lease
+        # counter. No network I/O may happen during garbage collection.
+        lease = getattr(self, "_online_lease", None)
+        self._online_lease = None
+        if lease is not None:
+            try:
+                lease.__exit__(None, None, None)
+            except Exception:
+                pass
 
     def _enter_online_mode(self) -> None:
         if self.mode != "online" or getattr(self, "_online_lease", None) is not None:

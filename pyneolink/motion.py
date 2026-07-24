@@ -64,6 +64,12 @@ class CameraEvent:
             return self.type == other
         return super().__eq__(other)
 
+    def __hash__(self) -> int:
+        # Keep hashing consistent with `__eq__`: an event compares equal to
+        # its normalized `EVENTS` member, so it must hash like it as well for
+        # set/dict membership (e.g. `event in {EVENTS.human}`) to match.
+        return hash(self.type)
+
     def __str__(self) -> str:
         state = "start" if self.active else "stop"
         return f"{self.type.value} {state}"
@@ -105,7 +111,13 @@ class CameraEvent:
 
 
 class CameraEvents(Iterator[CameraEvent]):
-    """Iterator/context manager that yields normalized camera motion events."""
+    """Iterator/context manager that yields normalized camera motion events.
+
+    Prefer wrapping in `with` (or calling `close()`) so the camera's online
+    lease is released deterministically; abandoned iterators only release the
+    lease when garbage collected. Once closed or exhausted, the iterator stays
+    exhausted — create a new one to watch again.
+    """
 
     def __init__(
         self,
@@ -128,6 +140,7 @@ class CameraEvents(Iterator[CameraEvent]):
         self.keepalive_interval = keepalive_interval
         self._lease = None
         self._active = False
+        self._closed = False
         self._pending: deque[CameraEvent] = deque()
         self._next_keepalive_at = 0.0
         self._deadline: float | None = None
@@ -141,10 +154,13 @@ class CameraEvents(Iterator[CameraEvent]):
         self.close()
 
     def __iter__(self) -> "CameraEvents":
-        self.start()
+        if not self._closed:
+            self.start()
         return self
 
     def __next__(self) -> CameraEvent:
+        if self._closed:
+            raise StopIteration
         self.start()
         if self._pending:
             return self._pending.popleft()
@@ -157,10 +173,14 @@ class CameraEvents(Iterator[CameraEvent]):
             if now >= self._next_keepalive_at:
                 self.camera.send(MSG.UDP_KEEPALIVE, channel_id=0, msg_num=0)
                 self._next_keepalive_at = now + self.keepalive_interval
+            recv_timeout = 1.0
+            if self._deadline is not None:
+                remaining = self._deadline - time.monotonic()
+                if remaining <= 0:
+                    self.close()
+                    raise StopIteration
+                recv_timeout = min(recv_timeout, remaining)
             try:
-                recv_timeout = 1.0
-                if self._deadline is not None:
-                    recv_timeout = min(recv_timeout, max(0.0, self._deadline - time.monotonic()))
                 reply = self.camera._recv(timeout=recv_timeout)
             except TimeoutError:
                 continue
@@ -172,45 +192,76 @@ class CameraEvents(Iterator[CameraEvent]):
         raise StopIteration
 
     def start(self) -> "CameraEvents":
-        """Start listening for camera motion events."""
+        """Start listening for camera motion events.
+
+        :raises ProtocolError: If the listener is already closed or the
+            camera rejects the motion request. Any failure after the online
+            lease was entered releases the lease again and closes the
+            listener; retrying requires a new `CameraEvents` object.
+        """
         if self._active:
             return self
+        if self._closed:
+            raise ProtocolError(msg.Error.EventListenerClosed)
         self._lease = self.camera.require_online()
         self._lease.__enter__()
-        reply = self.camera.command(MSG.MOTION_REQUEST)
-        if reply.header.response_code != 200:
+        try:
+            reply = self.camera.command(MSG.MOTION_REQUEST)
+            if reply.header.response_code != 200:
+                raise ProtocolError(msg.Error.EventStartFailed.format(response_code=reply.header.response_code))
+        except BaseException:
             self.close()
-            raise ProtocolError(msg.Error.EventStartFailed.format(response_code=reply.header.response_code))
+            raise
         self._active = True
         self._deadline = None if self.duration is None else time.monotonic() + max(0.0, self.duration)
         self._next_keepalive_at = time.monotonic() + self.keepalive_interval
         return self
 
     def close(self) -> None:
-        """Stop listening and release the online lease."""
+        """Stop listening and release the online lease.
+
+        Idempotent. After `close()` the iterator stays exhausted; create a
+        new `CameraEvents` object to watch again.
+        """
         self._active = False
+        self._closed = True
         self._pending.clear()
         self._deadline = None
         self._last_active_type = None
-        if self._lease is not None:
-            self._lease.__exit__(None, None, None)
-            self._lease = None
+        lease = self._lease
+        self._lease = None
+        if lease is not None:
+            lease.__exit__(None, None, None)
+
+    def __del__(self) -> None:
+        # Safety net for abandoned iterators: release only the online-lease
+        # counter. No network I/O may happen during garbage collection.
+        lease = getattr(self, "_lease", None)
+        self._lease = None
+        if lease is not None:
+            try:
+                lease.__exit__(None, None, None)
+            except Exception:
+                pass
 
     def status(self, *, timeout: float = 3.0) -> tuple[CameraEvent, bool]:
         """Read one motion status packet.
 
         :param timeout: Seconds to wait before returning an unknown status.
         """
-        self.start()
-        deadline = time.monotonic() + max(0.0, timeout)
         try:
+            self.start()
+            deadline = time.monotonic() + max(0.0, timeout)
             while time.monotonic() <= deadline:
                 now = time.monotonic()
                 if now >= self._next_keepalive_at:
                     self.camera.send(MSG.UDP_KEEPALIVE, channel_id=0, msg_num=0)
                     self._next_keepalive_at = now + self.keepalive_interval
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
                 try:
-                    reply = self.camera._recv(timeout=min(0.5, max(0.0, deadline - time.monotonic())))
+                    reply = self.camera._recv(timeout=min(0.5, remaining))
                 except TimeoutError:
                     continue
                 if reply.header.msg_id != MSG.MOTION:
